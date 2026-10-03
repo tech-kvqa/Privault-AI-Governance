@@ -1,0 +1,16 @@
+# Applies to the repo-root build context — used only by qa/Dockerfile.test (server/ and client/
+# each have their own .dockerignore for their own production image builds).
+#
+# Without this, `COPY . /workspace` (which runs AFTER `npm ci` has already installed clean,
+# correct-platform dependencies) would copy any host node_modules/ on top of them — silently
+# replacing a clean install with whatever's on the machine running `docker compose build`,
+# wrong-platform native bindings (bcrypt, etc.) included — and could pull real secrets from a
+# developer's .env files into the image, and bloat/slow the build context upload.
+**/node_modules
+**/dist
+**/.env
+**/.env.*
+!**/.env.example
+!**/.env.docker.example
+.git
+*.log

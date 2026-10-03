@@ -1,0 +1,37 @@
+{
+  "name": "privault-ai-governance-server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "commonjs",
+  "scripts": {
+    "dev": "nodemon src/index.js",
+    "start": "node scripts/startup.js",
+    "prisma:generate": "prisma generate",
+    "migrate": "node scripts/migrate.js",
+    "migrate:dev": "prisma migrate dev",
+    "seed": "node prisma/seed.js",
+    "test": "node --test test/*.test.js",
+    "migrate:status": "node scripts/migrate.js --status"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "cors": "^2.8.5",
+    "csv-parse": "^5.5.6",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "express-async-errors": "^3.1.1",
+    "express-rate-limit": "^7.4.0",
+    "helmet": "^7.1.0",
+    "jsonwebtoken": "^9.0.2",
+    "morgan": "^1.10.0",
+    "multer": "^2.4.0",
+    "pg": "^8.23.0",
+    "zod": "^3.23.8",
+    "@prisma/client": "6.19.3",
+    "@prisma/adapter-pg": "6.19.3",
+    "prisma": "6.19.3"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.4"
+  }
+}

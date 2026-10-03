@@ -1,0 +1,19 @@
+FROM node:22-bookworm-slim
+
+WORKDIR /workspace
+
+# Tools needed by the PostgreSQL fixture and test orchestration.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends postgresql-client ca-certificates bash curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY server/package.json server/package-lock.json /workspace/server/
+COPY client/package.json client/package-lock.json /workspace/client/
+
+RUN cd /workspace/server && npm ci
+RUN cd /workspace/client && npm ci
+
+COPY . /workspace
+
+WORKDIR /workspace
+ENTRYPOINT ["bash", "qa/run-full-tests.sh"]

@@ -1,0 +1,1420 @@
+// PRIVault AI Governance schema (phases 1-11)
+// Scope: multi-tenant foundation, auth/RBAC, AI System Inventory, Audit Trail.
+// Later phases (data discovery, lineage, consent, DSAR, Shadow AI, risk engine,
+// DPIA, decisions, incidents, kill switch, connectors, evidence, reporting)
+// extend this same schema — see /docs/phase-plan.md in the repo root.
+
+generator client {
+  provider   = "prisma-client-js"
+  // Rust-free client: no query-engine binary is downloaded or shipped. It talks to
+  // Postgres through the pg driver adapter (see src/lib/prisma.js). Works air-gapped.
+  }
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ---------- Enums ----------
+
+enum UserRole {
+  SUPER_ADMIN
+  AI_GOVERNANCE_ADMIN
+  PRIVACY_OFFICER
+  DPO
+  AI_SYSTEM_OWNER
+  DATA_OWNER
+  SECURITY_ADMIN
+  AUDITOR
+  HUMAN_REVIEWER
+  INCIDENT_MANAGER
+  READ_ONLY
+  CUSTOMER_APPEAL_USER
+}
+
+enum AiSystemStatus {
+  PROPOSED
+  ASSESSMENT
+  PENDING_APPROVAL
+  APPROVED
+  PRODUCTION
+  SUSPENDED
+  RETIRED
+}
+
+enum RiskClassification {
+  UNCLASSIFIED
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+enum DpiaStatus {
+  NOT_REQUIRED
+  REQUIRED_NOT_STARTED
+  IN_PROGRESS
+  COMPLETED
+  OVERDUE
+}
+
+enum EvidenceSourceType {
+  AUTOMATIC
+  CONNECTOR
+  API
+  MANUAL_UPLOAD
+  USER_ENTERED
+}
+
+// ---------- Core tenancy & identity ----------
+
+model Tenant {
+  id        String   @id @default(uuid())
+  name      String
+  createdAt DateTime @default(now())
+
+  // ---------- DPDP Act, 2023 — Data Fiduciary-level obligations ----------
+  // Section 8(9): a Data Fiduciary must publish the business contact
+  // information of its Data Protection Officer (or another person who can
+  // answer data-principal questions) — this is organization-level, not
+  // per-AI-system, so it lives on Tenant.
+  dpoName  String?
+  dpoEmail String?
+  dpoPhone String?
+
+  // Section 10: extra obligations apply once the Central Government
+  // notifies an entity as a "Significant Data Fiduciary" (by volume/
+  // sensitivity of data processed). Tracked here as attestable checklist
+  // items — Privault cannot verify a government notification or an
+  // external auditor's work itself, so these are self-reported with an
+  // audit trail, not automatically certified.
+  significantDataFiduciary  Boolean   @default(false)
+  independentAuditorName   String?
+  lastComplianceAuditAt    DateTime?
+  nextComplianceAuditDueAt DateTime?
+
+  // Section 6: default statutory-style response window Privault will use
+  // to auto-set a DSAR's due date. NOT a claim that this is the exact
+  // legally mandated number for every request type under the notified
+  // DPDP Rules — it is configurable per tenant precisely because the
+  // Rules specify timelines that can vary and that this deployment cannot
+  // independently verify are current. See DSAR module documentation.
+  dsarResponseDays Int @default(30)
+
+  // URL-safe organisation handle: used for the public rights-request portal (/portal/<slug>) and to
+  // disambiguate sign-in when one email exists in more than one organisation.
+  slug       String?  @unique
+  // When true every user must enrol a TOTP authenticator; un-enrolled users get a restricted session.
+  requireMfa Boolean  @default(false)
+
+  users     User[]
+  aiSystems AiSystem[]
+  auditLogs AuditLog[]
+
+  connectors      Connector[]
+  connectorRuns   ConnectorRun[]
+  dataAssets      DataAsset[]
+  piiFindings     PiiFinding[]
+  piiRecordValues PiiRecordValue[]
+  lineageEdges    LineageEdge[]
+
+  consents           Consent[]
+  dsars              Dsar[]
+  dsarImpactRecords  DsarImpactRecord[]
+  remediationActions RemediationAction[]
+
+  knowledgeBases          KnowledgeBase[]
+  knowledgeBaseDocuments  KnowledgeBaseDocument[]
+  documentChunks          DocumentChunk[]
+  shadowAiPolicies        ShadowAiPolicy[]
+  shadowAiEvents          ShadowAiEvent[]
+
+  dpias               Dpia[]
+  complianceControls  ComplianceControl[]
+  automatedDecisions  AutomatedDecision[]
+  appeals             Appeal[]
+  incidents           Incident[]
+  emergencyActions    EmergencyAction[]
+  nominees            Nominee[]
+  vendors             Vendor[]
+  evidenceItems       Evidence[]
+  webhookEndpoints    WebhookEndpoint[]
+  webhookDeliveries   WebhookDelivery[]
+  sessions            Session[]
+  userTokens          UserToken[]
+  dsarIntakes         DsarIntake[]
+
+  @@map("tenants")
+}
+
+model User {
+  id           String   @id @default(uuid())
+  tenantId     String
+  tenant       Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  email        String
+  passwordHash String
+  name         String
+  role         UserRole
+  isActive     Boolean  @default(true)
+
+  // Sign-in hardening
+  failedLoginCount Int       @default(0)
+  lockedUntil      DateTime?
+  lastLoginAt      DateTime?
+  passwordChangedAt DateTime?
+
+  // TOTP (RFC 6238). The secret is AES-256-GCM encrypted at rest; recovery codes are stored only as SHA-256 hashes.
+  mfaEnabled            Boolean  @default(false)
+  mfaSecretEncrypted    String?
+  mfaLastStep           Int? // last accepted 30-second step — a code can't be replayed
+  mfaRecoveryHashes     Json @default("[]")
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  ownedAiSystems AiSystem[] @relation("AiSystemGovernanceOwner")
+  auditLogs      AuditLog[]
+
+  assignedDsars         Dsar[]               @relation("DsarAssignee")
+  ownedRemediations     RemediationAction[]   @relation("RemediationOwner")
+  reviewedRemediations  RemediationAction[]   @relation("RemediationReviewer")
+
+  approvedDpias        Dpia[]               @relation("DpiaApprover")
+  ownedComplianceControls ComplianceControl[] @relation("ComplianceOwner")
+  reviewedDecisions    AutomatedDecision[]  @relation("DecisionReviewer")
+  reviewedAppeals      Appeal[]             @relation("AppealReviewer")
+  executedEmergencyActions EmergencyAction[] @relation("EmergencyExecutor")
+  verifiedConsents     Consent[]            @relation("ConsentVerifier")
+  approvedEmergencyActionsList EmergencyAction[] @relation("EmergencyApprover")
+  uploadedEvidence     Evidence[]           @relation("EvidenceUploader")
+  reviewedEvidence     Evidence[]           @relation("EvidenceReviewer")
+  sessions             Session[]
+  tokens               UserToken[]
+  verifiedIntakes      DsarIntake[]         @relation("IntakeVerifier")
+
+  @@unique([tenantId, email])
+  @@index([tenantId])
+  @@map("users")
+}
+
+// ---------- Module 01 — AI System Inventory ----------
+
+model AiSystem {
+  id       String @id @default(uuid())
+  tenantId String
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  name        String
+  description String?
+
+  // Ownership (Section 3 / 4)
+  businessOwner       String?
+  technicalOwner      String?
+  privacyOwner        String?
+  aiGovernanceOwnerId String?
+  aiGovernanceOwner   User?   @relation("AiSystemGovernanceOwner", fields: [aiGovernanceOwnerId], references: [id])
+
+  // Vendor / model
+  vendor               String?
+  model                String?
+  modelProvider        String?
+  modelVersion         String?
+  deploymentEnvironment String? // e.g. Production, Staging, Sandbox
+  hostingLocation      String?
+  processingLocation   String?
+
+  // Purpose & population
+  purpose          String?
+  businessFunction String?
+  userPopulation   String?
+  dataSubjects     String?
+
+  // Data categories (Phase 1: free-form tag arrays; PII detection engine in Phase 2 will
+  // populate these from real scans rather than manual entry alone)
+  personalDataCategories  Json @default("[]")
+  sensitiveDataCategories Json @default("[]")
+
+  // AI usage flags
+  trainingUsage          Boolean @default(false)
+  fineTuningUsage        Boolean @default(false)
+  ragUsage                Boolean @default(false)
+  automatedDecisionUsage Boolean @default(false)
+  humanOversight          Boolean @default(true)
+  crossBorderProcessing   Boolean @default(false)
+
+  retention           String?
+  retentionPeriodDays Int? // structured form of the field above — lets the system compute an erasure-obligation flag (DPDP Section 8(7)/(8)) rather than only holding a human-readable label
+  dpiaStatus           DpiaStatus         @default(NOT_REQUIRED)
+  riskClassification    RiskClassification @default(UNCLASSIFIED)
+  riskRationale         String? // Section 19: never rely on an opaque score alone — always explain why
+  securityControls      String?
+
+  // ---------- DPDP Act, 2023 — system-level flags ----------
+  // Section 9: processing a child's (under-18) personal data requires
+  // verifiable parental consent, and prohibits tracking/behavioral
+  // monitoring and targeted advertising directed at children. These two
+  // flags exist so that combination can be surfaced as a real, computed
+  // risk factor (see server/src/lib/riskEngine.js) rather than left to a
+  // human to remember.
+  processesChildrensData    Boolean @default(false)
+  behavioralTrackingOrAds   Boolean @default(false)
+
+  // Section 16: cross-border transfer is permitted by default, EXCEPT to
+  // countries the Central Government restricts by notification. Privault
+  // cannot know the current notified list with certainty (it can change,
+  // and this deployment has no live feed of it) — so this flag is a
+  // tenant/legal-team attestation, not an automated legal determination.
+  // See server/src/lib/restrictedCountries.js for the honesty note this
+  // carries through to the UI.
+  crossBorderRestrictedCountry Boolean @default(false)
+
+  status         AiSystemStatus @default(PROPOSED)
+  approvalStatus String?        @default("Not submitted")
+
+  lastAssessmentAt DateTime?
+  nextReviewAt     DateTime?
+
+  // Provenance of this record's data — Section 2: never represent manual data as verified
+  dataSourceType EvidenceSourceType @default(USER_ENTERED)
+
+  createdById String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  dataAssets DataAsset[]
+
+  consents      Consent[]
+  dsarImpactRecords DsarImpactRecord[]
+  remediationActions RemediationAction[]
+  knowledgeBases KnowledgeBase[]
+
+  dpias              Dpia[]
+  complianceControls ComplianceControl[]
+  automatedDecisions AutomatedDecision[]
+  incidents          Incident[]
+  emergencyActions   EmergencyAction[]
+  evidenceItems      Evidence[]
+
+  vendorId     String?
+  vendorRecord Vendor? @relation("AiSystemVendor", fields: [vendorId], references: [id])
+
+  @@index([tenantId])
+  @@index([tenantId, status])
+  @@index([tenantId, riskClassification])
+  @@map("ai_systems")
+}
+
+// ---------- Module 16 — Audit Center (foundation) ----------
+
+// ---------- Phase 2 — Connector framework, AI Data Discovery, Lineage ----------
+// Section 37 (connector lifecycle), Section 5/6 (discovery + PII engine),
+// Section 8/9 ("Find Me in AI" over the privacy graph).
+//
+// Honesty constraint carried over from Phase 1 (Section 2 / Section 25): this
+// phase only implements Mode C — manual evidence (file upload) — for real.
+// Live Mode A/B connectors (databases, cloud storage, vector DBs) are modeled
+// so the UI and API shape are correct, but they're created with status
+// NOT_CONFIGURED and the API refuses to "run" them — never simulated.
+
+enum ConnectorType {
+  FILE_UPLOAD
+  DATABASE
+  CLOUD_STORAGE
+  VECTOR_DB
+  SAAS_API
+}
+
+enum ConnectorStatus {
+  CONNECTED       // Mode C file-upload connectors are usable immediately
+  NOT_CONFIGURED  // Mode A/B connector types with no real backing integration yet
+}
+
+enum ConnectorRunStatus {
+  RUNNING
+  SUCCESS
+  FAILED
+}
+
+enum PiiDetectionMethod {
+  REGEX
+  CHECKSUM   // regex + a real checksum validator (Luhn / Verhoeff)
+  DICTIONARY // column-header name match, no content validation
+}
+
+enum DataAssetStatus {
+  SCANNED
+  FAILED
+}
+
+enum LineageNodeType {
+  DATA_ASSET
+  AI_SYSTEM
+}
+
+enum LineageRelationship {
+  FEEDS       // DataAsset -> AiSystem
+  TRAINED_ON  // DataAsset -> AiSystem (trainingUsage)
+  USED_IN_RAG // DataAsset -> AiSystem (ragUsage)
+}
+
+model Connector {
+  id       String          @id @default(uuid())
+  tenantId String
+  tenant   Tenant          @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  name     String
+  type     ConnectorType
+  status   ConnectorStatus @default(NOT_CONFIGURED)
+  config   Json? // non-secret connection details (host, port, database, user, sslmode)
+  // Password / secret material, AES-256-GCM encrypted at rest (Section 38).
+  // Never returned by any API and never stored inside `config`.
+  credentialsEncrypted String?
+  lastTestedAt DateTime?
+  lastTestOk   Boolean?
+  lastError    String?
+
+  createdById String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  runs ConnectorRun[]
+
+  @@index([tenantId])
+  @@map("connectors")
+}
+
+model ConnectorRun {
+  id          String             @id @default(uuid())
+  tenantId    String
+  tenant      Tenant             @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  connectorId String
+  connector   Connector          @relation(fields: [connectorId], references: [id], onDelete: Cascade)
+  status      ConnectorRunStatus @default(RUNNING)
+  startedAt   DateTime           @default(now())
+  finishedAt  DateTime?
+  recordsScanned Int    @default(0)
+  findingsCount  Int    @default(0)
+  errorMessage   String?
+
+  dataAssets DataAsset[]
+
+  @@index([tenantId])
+  @@map("connector_runs")
+}
+
+model DataAsset {
+  id       String @id @default(uuid())
+  tenantId String
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  connectorRunId String?
+  connectorRun    ConnectorRun? @relation(fields: [connectorRunId], references: [id])
+
+  name             String
+  originalFilename String?
+  mimeType         String?
+  sizeBytes        Int?
+  rowCount         Int?
+  columnCount      Int?
+
+  aiSystemId String?
+  aiSystem   AiSystem? @relation(fields: [aiSystemId], references: [id])
+
+  dataSourceType EvidenceSourceType @default(MANUAL_UPLOAD)
+  status         DataAssetStatus    @default(SCANNED)
+  scannedAt      DateTime?
+
+  // Coverage honesty (Find Me in AI depends on this): a scan that only saw a
+  // sample of a source cannot support a claim that something is ABSENT from it.
+  scanComplete Boolean @default(true) // false => sampled/truncated; absence can't be concluded
+  rowsScanned  Int?
+  sourceRef    String? // stable identity for connector-sourced assets, e.g. postgres:<connectorId>:public.customers
+  indexedAsHash Boolean @default(false) // true => PII values are stored only as keyed HMACs, never in clear
+
+  createdById    String?
+  createdAt      DateTime @default(now())
+
+  findings PiiFinding[]
+  values   PiiRecordValue[]
+
+  dsarImpactRecords  DsarImpactRecord[]
+  remediationActions RemediationAction[]
+  knowledgeBaseDocuments KnowledgeBaseDocument[]
+
+  @@index([tenantId])
+  @@index([tenantId, sourceRef])
+  @@map("data_assets")
+}
+
+// One row per (data asset, column) that the PII engine classified.
+model PiiFinding {
+  id       String @id @default(uuid())
+  tenantId String
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  dataAssetId String
+  dataAsset   DataAsset @relation(fields: [dataAssetId], references: [id], onDelete: Cascade)
+
+  category         String // e.g. Email, Phone, PAN, Aadhaar, Credit/Debit Card, IP Address, Name
+  column           String?
+  detectionMethod  PiiDetectionMethod
+  confidence       Float  // 0–1, the fraction of sampled non-empty cells that matched
+  matchCount       Int
+  sampleRowsScanned Int
+  createdAt        DateTime @default(now())
+
+  @@index([tenantId, dataAssetId])
+  @@map("pii_findings")
+}
+
+// One row per matched cell value, capped per scan — this is what powers
+// "Find Me in AI" (Module 04): an exact-match index of detected PII values.
+model PiiRecordValue {
+  id       String @id @default(uuid())
+  tenantId String
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  dataAssetId String
+  dataAsset   DataAsset @relation(fields: [dataAssetId], references: [id], onDelete: Cascade)
+
+  category  String
+  column    String?
+  value     String
+  rowNumber Int
+
+  @@index([tenantId, value])
+  @@index([tenantId, dataAssetId])
+  @@map("pii_record_values")
+}
+
+// Minimal Privacy Graph edges (Section 8) — Phase 2 only connects DataAsset
+// <-> AiSystem; later phases add Vendor, Consent, DSAR, Decision, etc. nodes.
+model LineageEdge {
+  id       String @id @default(uuid())
+  tenantId String
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  sourceType LineageNodeType
+  sourceId   String
+  targetType LineageNodeType
+  targetId   String
+  relationship LineageRelationship
+
+  createdAt DateTime @default(now())
+
+  @@index([tenantId])
+  @@unique([tenantId, sourceType, sourceId, targetType, targetId, relationship])
+  @@map("lineage_edges")
+}
+
+// ---------- Phase 3 — Consent, DSAR, and the Deletion/Remediation engine ----------
+// Section 10 (Consent), Section 11 (Data Subject Rights), Section 12
+// (Deletion Engine), Section 13 (Remediation Workflow).
+//
+// Honesty constraint (Section 12, carried from Phase 1/2): Privault does not
+// own the source systems a data asset was uploaded from, so DELETE here
+// means "removed from Privault's own detected-PII index" — that's a real,
+// executable, auditable action. EXCLUDE/RETRAIN (training-data exclusion,
+// model retraining) and EMBEDDING_DELETE/INDEX_REBUILD (RAG/vector store)
+// need a live integration into the customer's ML pipeline this phase
+// doesn't have, so those actions are created REQUIRES_INTEGRATION and can
+// only be closed by a human recording real evidence (Mode C) — never
+// auto-completed. See Section 12: "Never falsely claim that deleting source
+// data automatically removes learned information from a trained model."
+
+enum ConsentStatus {
+  GRANTED
+  WITHDRAWN
+  EXPIRED
+  PENDING
+  REJECTED
+  NOT_REQUIRED
+}
+
+enum DsarRequestType {
+  ACCESS
+  CORRECTION
+  DELETION
+  RESTRICTION
+  OBJECTION
+  CONSENT_WITHDRAWAL
+  AI_PROCESSING_INQUIRY
+  AUTOMATED_DECISION_CHALLENGE
+  GRIEVANCE // DPDP: grievance redressal
+}
+
+enum DsarStatus {
+  RECEIVED
+  IMPACT_ANALYSIS
+  REMEDIATION_PLANNED
+  IN_EXECUTION
+  VERIFICATION
+  CLOSED
+}
+
+enum RemediationActionType {
+  DELETE            // real: removes matching PiiRecordValue rows from Privault's index
+  EXCLUDE           // needs integration: exclude subject from future training runs
+  DE_LINK           // needs integration: break subject<->record association at source
+  EMBEDDING_DELETE  // needs integration: delete vectors from a live vector store
+  INDEX_REBUILD     // needs integration: rebuild a retrieval index
+  RETRAIN           // needs integration: flag model for retraining
+  MODEL_IMPACT_REVIEW // human review: does this change require model-level action?
+}
+
+enum RemediationActionStatus {
+  PENDING
+  REQUIRES_INTEGRATION // Section 25's "CONTROL AVAILABLE — INTEGRATION REQUIRED", applied to remediation
+  COMPLETED
+  MANUALLY_ATTESTED    // closed via Mode C evidence (a human recorded what they did outside Privault)
+}
+
+model Consent {
+  id       String @id @default(uuid())
+  tenantId String
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  dataSubjectIdentifier String // email, customer ID, etc. — matched against PiiRecordValue.value
+  purpose               String
+  aiSystemId            String?
+  aiSystem              AiSystem? @relation(fields: [aiSystemId], references: [id])
+  processingActivity    String?
+  dataCategory          String?
+  legalBasis            String?
+  status                ConsentStatus @default(GRANTED)
+  collectedAt           DateTime      @default(now())
+  withdrawnAt           DateTime?
+  source                String? // e.g. "Web form", "Mobile app", "Manual entry"
+  version               String?
+  notice                String?
+
+  // DPDP Act, 2023 Section 9 — a minor's consent alone is not valid; it
+  // must be verifiable parental/guardian consent. `isMinorDataSubject` is
+  // asserted by whoever records the consent (Privault has no independent
+  // age-verification signal); the API refuses to leave a minor's consent
+  // GRANTED unless parentalConsentVerified is also true.
+  isMinorDataSubject       Boolean   @default(false)
+  parentalConsentVerified  Boolean   @default(false)
+  verifiedById             String?
+  verifiedBy               User?     @relation("ConsentVerifier", fields: [verifiedById], references: [id])
+  verifiedAt               DateTime?
+
+  createdById String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([tenantId])
+  @@index([tenantId, dataSubjectIdentifier])
+  @@map("consents")
+}
+
+// DPDP Act, 2023 Section 14 — the "Right to Nominate": a Data Principal
+// may register another individual to exercise their rights in the event
+// of death or incapacity. A nominee is registered ahead of time, against
+// the data principal's own identifier, independent of any single DSAR.
+model Nominee {
+  id       String @id @default(uuid())
+  tenantId String
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  dataSubjectIdentifier String // the data principal who registered this nominee
+  nomineeName           String
+  nomineeContact        String
+  relationship          String?
+  registeredAt          DateTime @default(now())
+
+  createdById String?
+  createdAt   DateTime @default(now())
+
+  dsars Dsar[]
+
+  @@index([tenantId, dataSubjectIdentifier])
+  @@map("nominees")
+}
+
+model Dsar {
+  id       String @id @default(uuid())
+  tenantId String
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  dataSubjectIdentifier String
+  requestType           DsarRequestType
+  status                DsarStatus @default(RECEIVED)
+  notes                 String?
+  submittedAt           DateTime   @default(now())
+  dueDate               DateTime?
+  closedAt              DateTime?
+
+  triggeredByConsentId String? // set when Section 10's "consent withdrawal auto-creates a DSAR" fires
+
+  // DPDP Section 14 — set when a registered nominee (not the data
+  // principal themself) submits this request on the principal's behalf.
+  actingNomineeId String?
+  actingNominee   Nominee? @relation(fields: [actingNomineeId], references: [id])
+
+  assignedToId String?
+  assignedTo   User?   @relation("DsarAssignee", fields: [assignedToId], references: [id])
+  createdById  String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  impactRecords DsarImpactRecord[]
+  actions       RemediationAction[]
+  intake        DsarIntake?
+
+  @@index([tenantId])
+  @@index([tenantId, status])
+  @@map("dsars")
+}
+
+// Immutable snapshot of what "Find Me in AI" found at the moment impact
+// analysis ran — a DSAR's evidence trail shouldn't silently change if the
+// underlying data changes later.
+model DsarImpactRecord {
+  id       String @id @default(uuid())
+  tenantId String
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  dsarId      String
+  dsar        Dsar   @relation(fields: [dsarId], references: [id], onDelete: Cascade)
+  dataAssetId String?
+  dataAsset   DataAsset? @relation(fields: [dataAssetId], references: [id])
+  aiSystemId  String?
+  aiSystem    AiSystem?  @relation(fields: [aiSystemId], references: [id])
+
+  category      String
+  column        String?
+  discoveredAt  DateTime @default(now())
+
+  @@index([tenantId, dsarId])
+  @@map("dsar_impact_records")
+}
+
+model RemediationAction {
+  id       String @id @default(uuid())
+  tenantId String
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  dsarId      String
+  dsar        Dsar   @relation(fields: [dsarId], references: [id], onDelete: Cascade)
+  dataAssetId String?
+  dataAsset   DataAsset? @relation(fields: [dataAssetId], references: [id])
+  aiSystemId  String?
+  aiSystem    AiSystem?  @relation(fields: [aiSystemId], references: [id])
+
+  actionType RemediationActionType
+  status     RemediationActionStatus @default(PENDING)
+
+  ownerId    String?
+  owner      User?   @relation("RemediationOwner", fields: [ownerId], references: [id])
+  reviewerId String?
+  reviewer   User?   @relation("RemediationReviewer", fields: [reviewerId], references: [id])
+
+  dueDate     DateTime?
+  evidence    String? // for DELETE: auto-filled with what was removed; for manual actions: what the reviewer attests
+  comments    String?
+  completedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([tenantId, dsarId])
+  @@map("remediation_actions")
+}
+
+// ---------- Phase 4 — RAG Governance + Shadow AI ----------
+// Section 14 (RAG Governance) and Section 15–18 (Shadow AI + policy engine).
+//
+// Honesty constraint, same pattern as every prior phase: real work stays
+// real, unbuildable infrastructure is modeled and clearly labeled rather
+// than faked.
+//   - RAG: chunking a document is real, deterministic code. Generating
+//     embeddings and writing them to a vector store needs a live embedding
+//     model + vector DB this deployment doesn't have — `KnowledgeBase`
+//     tracks that as `vectorStoreStatus: NOT_CONFIGURED`, the same pattern
+//     Phase 2's Connector used for DATABASE/CLOUD_STORAGE/VECTOR_DB types.
+//   - Shadow AI: a real browser extension / endpoint agent (Section 16) is
+//     client software outside this backend's scope. Phase 4 implements
+//     Mode C manual/CSV event ingestion, but runs every event through a
+//     REAL policy engine — and if an event includes an uploaded file, it is
+//     actually scanned by Phase 2's PII detection engine, not labeled by
+//     guesswork. `recommendedAction` + `enforced: false` reflects that
+//     Privault can recommend/log an action here but has no live agent to
+//     enforce it.
+
+enum RagVectorStoreStatus {
+  NOT_CONFIGURED
+  CONNECTED
+}
+
+enum ShadowAiEventType {
+  AI_WEBSITE_VISIT
+  FILE_UPLOAD_TO_AI
+  API_CALL_TO_AI
+  BROWSER_EXTENSION_DETECTED
+  UNAUTHORIZED_AGENT_DETECTED
+}
+
+enum PolicyAction {
+  ALLOW
+  WARN
+  BLOCK
+  REQUIRE_JUSTIFICATION
+  CREATE_INCIDENT
+}
+
+model KnowledgeBase {
+  id       String @id @default(uuid())
+  tenantId String
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  name        String
+  description String?
+  aiSystemId  String?
+  aiSystem    AiSystem? @relation(fields: [aiSystemId], references: [id])
+
+  vectorStoreStatus RagVectorStoreStatus @default(NOT_CONFIGURED)
+  vectorStoreNote   String? @default("CONTROL AVAILABLE — INTEGRATION REQUIRED. No embedding model or vector store is configured in this deployment.")
+
+  createdById String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  documents KnowledgeBaseDocument[]
+
+  @@index([tenantId])
+  @@map("knowledge_bases")
+}
+
+// A document ingested into a knowledge base. Reuses Phase 2's DataAsset for
+// the underlying file (upload, size, PII findings via the same scan
+// pipeline) and adds RAG-specific state (chunking) on top.
+model KnowledgeBaseDocument {
+  id              String        @id @default(uuid())
+  tenantId        String
+  tenant          Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  knowledgeBaseId String
+  knowledgeBase   KnowledgeBase @relation(fields: [knowledgeBaseId], references: [id], onDelete: Cascade)
+  dataAssetId     String
+  dataAsset       DataAsset     @relation(fields: [dataAssetId], references: [id])
+
+  chunkCount Int      @default(0)
+  chunkedAt  DateTime?
+
+  createdById String?
+  createdAt   DateTime @default(now())
+
+  chunks DocumentChunk[]
+
+  @@index([tenantId, knowledgeBaseId])
+  @@map("knowledge_base_documents")
+}
+
+model DocumentChunk {
+  id         String                 @id @default(uuid())
+  tenantId   String
+  tenant     Tenant                 @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  documentId String
+  document   KnowledgeBaseDocument  @relation(fields: [documentId], references: [id], onDelete: Cascade)
+
+  chunkIndex Int
+  content    String
+  charCount  Int
+
+  // Real chunking happens now; embedding generation needs a configured
+  // vector store (see KnowledgeBase.vectorStoreStatus) — this stays null
+  // until one exists, rather than a fabricated vector.
+  embeddingStatus RagVectorStoreStatus @default(NOT_CONFIGURED)
+
+  createdAt DateTime @default(now())
+
+  @@index([tenantId, documentId])
+  @@map("document_chunks")
+}
+
+model ShadowAiPolicy {
+  id       String @id @default(uuid())
+  tenantId String
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  name        String
+  description String?
+  // Simple, real rule conditions — evaluated in server/src/lib/policyEngine.js.
+  requireExternalAi   Boolean  @default(true)
+  requirePersonalData Boolean  @default(true)
+  categories          Json @default("[]") // empty = any category counts
+  action              PolicyAction @default(WARN)
+  enabled             Boolean  @default(true)
+  priority            Int      @default(0) // lower runs first; first match wins
+
+  createdById String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  events ShadowAiEvent[]
+
+  @@index([tenantId])
+  @@map("shadow_ai_policies")
+}
+
+model ShadowAiEvent {
+  id       String @id @default(uuid())
+  tenantId String
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  employeeIdentifier String
+  application        String
+  destination        String?
+  eventType          ShadowAiEventType
+  isExternalAi       Boolean @default(true)
+
+  fileName      String?
+  piiDetected   Boolean  @default(false)
+  piiCategories Json @default("[]")
+  recordCount   Int?
+
+  matchedPolicyId  String?
+  matchedPolicy    ShadowAiPolicy? @relation(fields: [matchedPolicyId], references: [id])
+  recommendedAction PolicyAction   @default(ALLOW)
+  enforced          Boolean        @default(false) // always false — no live agent to enforce it (Section 25)
+
+  detectedAt  DateTime @default(now())
+  source      EvidenceSourceType @default(MANUAL_UPLOAD)
+  createdById String?
+
+  incidents Incident[]
+
+  @@index([tenantId])
+  @@index([tenantId, detectedAt])
+  @@map("shadow_ai_events")
+}
+
+// ---------- Phase 5 — AI Risk, DPIA, Compliance Framework Mapping ----------
+// Section 19 (Risk Engine), Section 20 (DPIA), Section 52 (Framework Mapping).
+
+enum DpiaWorkflowStatus {
+  DRAFT
+  IN_REVIEW
+  APPROVED
+  REJECTED
+}
+
+enum ComplianceFramework {
+  DPDP
+  GDPR
+  ISO_27701
+  ISO_27001
+  ISO_42001
+  NIST_AI_RMF
+  ORG_POLICY
+}
+
+enum ControlType {
+  LEGAL_REQUIREMENT
+  ORG_POLICY
+  FRAMEWORK_CONTROL
+  RECOMMENDED_PRACTICE
+}
+
+enum ControlStatus {
+  NOT_STARTED
+  IN_PROGRESS
+  IMPLEMENTED
+  NOT_APPLICABLE
+}
+
+model Dpia {
+  id       String @id @default(uuid())
+  tenantId String
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  aiSystemId String
+  aiSystem   AiSystem @relation(fields: [aiSystemId], references: [id])
+
+  status       DpiaWorkflowStatus @default(DRAFT)
+  // Section 20's 17 sections, stored as one structured object rather than
+  // 17 columns — the shape is documented in server/src/lib/dpiaTemplate.js,
+  // and pre-filled from real data already in the system (Phase 1's AI
+  // system fields, Phase 2's data categories) rather than asked for twice.
+  sections     Json
+  residualRisk RiskClassification?
+
+  approvedById String?
+  approvedBy   User?     @relation("DpiaApprover", fields: [approvedById], references: [id])
+  approvedAt   DateTime?
+  reviewDate   DateTime?
+
+  createdById String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([tenantId, aiSystemId])
+  @@map("dpias")
+}
+
+model ComplianceControl {
+  id       String @id @default(uuid())
+  tenantId String
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  aiSystemId String?
+  aiSystem   AiSystem? @relation(fields: [aiSystemId], references: [id])
+
+  framework   ComplianceFramework
+  requirement String
+  control     String
+  controlType ControlType
+  status      ControlStatus @default(NOT_STARTED)
+  evidenceNote String?
+  ownerId      String?
+  owner        User?   @relation("ComplianceOwner", fields: [ownerId], references: [id])
+  evidenceItems Evidence[]
+  reviewDate   DateTime?
+
+  createdById String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([tenantId])
+  @@map("compliance_controls")
+}
+
+// ---------- Phase 6 — Automated Decisions, Human Review, Appeals ----------
+// Section 21 (High-Impact Decisions), Section 22 (Human Review), Section 23 (Appeals).
+
+enum DecisionReviewStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  OVERRIDDEN
+  ESCALATED
+}
+
+enum AppealStatus {
+  SUBMITTED
+  UNDER_INVESTIGATION
+  DECIDED
+}
+
+model AutomatedDecision {
+  id       String @id @default(uuid())
+  tenantId String
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  aiSystemId            String
+  aiSystem              AiSystem @relation(fields: [aiSystemId], references: [id])
+  dataSubjectIdentifier String
+  inputSummary          String?
+  decision              String // the AI's recommendation/outcome, e.g. "Declined"
+  modelVersion          String?
+  riskLevel             RiskClassification @default(MEDIUM)
+
+  reviewStatus   DecisionReviewStatus @default(PENDING)
+  reviewerId     String?
+  reviewer       User?    @relation("DecisionReviewer", fields: [reviewerId], references: [id])
+  overrideReason String?
+  finalOutcome   String?
+  reviewedAt     DateTime?
+
+  decidedAt DateTime @default(now())
+  createdById String?
+
+  appeals Appeal[]
+
+  @@index([tenantId])
+  @@index([tenantId, reviewStatus])
+  @@map("automated_decisions")
+}
+
+model Appeal {
+  id       String @id @default(uuid())
+  tenantId String
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  decisionId            String
+  decision              AutomatedDecision @relation(fields: [decisionId], references: [id], onDelete: Cascade)
+  dataSubjectIdentifier String
+  reason                String
+  evidence              String?
+
+  status     AppealStatus @default(SUBMITTED)
+  reviewerId String?
+  reviewer   User?   @relation("AppealReviewer", fields: [reviewerId], references: [id])
+  outcome    String?
+  decidedAt  DateTime?
+
+  createdById String?
+  createdAt   DateTime @default(now())
+
+  @@index([tenantId])
+  @@map("appeals")
+}
+
+// ---------- Phase 7 — Incidents, Monitoring, Emergency Controls ----------
+// Section 24 (Incident Management), Section 25/26 (Emergency Controls / Kill
+// Switch), Section 27 (Monitoring — implemented as live-query dashboards,
+// not a new table).
+
+enum IncidentType {
+  PII_LEAKAGE
+  SHADOW_AI
+  UNAUTHORIZED_TRAINING
+  PROMPT_DATA_EXPOSURE
+  RAG_LEAKAGE
+  MODEL_OUTPUT_PII
+  VENDOR_BREACH
+  UNAUTHORIZED_MODEL_ACCESS
+  DATA_POISONING
+  PRIVACY_CONTROL_FAILURE
+}
+
+enum IncidentStatus {
+  DETECTED
+  CLASSIFIED
+  CONTAINED
+  INVESTIGATING
+  REMEDIATED
+  REVIEWED
+  CLOSED
+}
+
+model Incident {
+  id       String @id @default(uuid())
+  tenantId String
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  aiSystemId      String?
+  aiSystem        AiSystem? @relation(fields: [aiSystemId], references: [id])
+  shadowAiEventId String?
+  shadowAiEvent   ShadowAiEvent? @relation(fields: [shadowAiEventId], references: [id])
+
+  type        IncidentType
+  status      IncidentStatus     @default(DETECTED)
+  severity    RiskClassification @default(MEDIUM)
+  description String
+  evidence    String?
+
+  detectedAt DateTime  @default(now())
+  closedAt   DateTime?
+
+  // ---------- DPDP Act, 2023 Section 8(6) — personal data breach ----------
+  // The Act requires the Data Fiduciary to notify the Data Protection
+  // Board of India and affected Data Principals "in such manner and
+  // within such period as may be prescribed" by Rules. This deployment
+  // does not assert a specific hour/day count as legally authoritative —
+  // the notified DPDP Rules should be confirmed directly; what this
+  // tracks is real: whether this incident IS a personal data breach,
+  // whether notification is therefore required, and whether/when it
+  // actually happened.
+  isPersonalDataBreach        Boolean   @default(false)
+  affectedDataSubjectCount    Int?
+  dpbNotificationRequired     Boolean   @default(false)
+  dpbNotifiedAt                DateTime?
+  affectedPrincipalsNotifiedAt DateTime?
+
+  createdById String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([tenantId])
+  @@index([tenantId, status])
+  @@map("incidents")
+}
+
+// Section 26 — real, executable only for what Privault itself controls
+// (an AI system's own lifecycle status). Everything that would need to
+// reach into live infrastructure (an API gateway, Kubernetes, IAM, a model
+// server) is created REQUIRES_INTEGRATION — same pattern as Phase 2's
+// connectors and Phase 3's remediation actions. Section 25: "Never simulate
+// successful execution."
+enum EmergencyActionType {
+  STOP_AI_SYSTEM      // real: sets AiSystem.status = SUSPENDED
+  DISABLE_API
+  REVOKE_CREDENTIAL
+  STOP_DATA_FEED
+  DISABLE_AGENT
+  DISABLE_RAG
+  ROLLBACK_MODEL
+  ISOLATE_SERVICE
+}
+
+enum EmergencyActionStatus {
+  EXECUTED
+  REQUIRES_INTEGRATION
+  PENDING_APPROVAL // dual control: a second, different authorized person must approve before it runs
+  REJECTED
+}
+
+model EmergencyAction {
+  id       String @id @default(uuid())
+  tenantId String
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  aiSystemId String
+  aiSystem   AiSystem @relation(fields: [aiSystemId], references: [id])
+
+  actionType EmergencyActionType
+  status     EmergencyActionStatus
+  reason     String
+  ticketRef  String?
+
+  executedById String?
+  executedBy   User?    @relation("EmergencyExecutor", fields: [executedById], references: [id])
+  executedAt   DateTime @default(now())
+
+  approvedById String?
+  approvedBy   User?     @relation("EmergencyApprover", fields: [approvedById], references: [id])
+  approvedAt   DateTime?
+  decisionNote String?
+
+  @@index([tenantId])
+  @@map("emergency_actions")
+}
+
+// ---------- Phase 10 — Vendors, Evidence, Webhooks ----------
+// Section 3/29 (Vendor governance, Evidence management), Section 26 (dual
+// approval), Section 43 (event-driven architecture).
+
+enum EvidenceReviewStatus {
+  PENDING
+  ACCEPTED
+  REJECTED
+}
+
+model Vendor {
+  id       String @id @default(uuid())
+  tenantId String
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  name     String
+  category String? // e.g. Model provider, Cloud, ATS
+  country  String?
+  contactEmail String?
+
+  // DPDP s.8(2): a Data Fiduciary may engage a Data Processor only under a
+  // valid contract. Whether a DPA is signed is a recorded fact; the risk
+  // engine uses it, and it is never assumed.
+  dpaSigned    Boolean   @default(false)
+  dpaSignedAt  DateTime?
+  securityReviewAt      DateTime?
+  securityReviewOutcome String?
+  isSubProcessor Boolean @default(false)
+  riskTier       RiskClassification @default(UNCLASSIFIED)
+  notes          String?
+
+  createdById String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  aiSystems AiSystem[] @relation("AiSystemVendor")
+
+  @@index([tenantId])
+  @@map("vendors")
+}
+
+// Evidence files are stored with a SHA-256 computed at upload time. Every
+// download and every explicit verify recomputes the hash from the stored
+// bytes and compares — tampering or corruption is detected, not assumed away.
+model Evidence {
+  id       String @id @default(uuid())
+  tenantId String
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  title       String
+  description String?
+
+  controlId String?
+  control   ComplianceControl? @relation(fields: [controlId], references: [id])
+  aiSystemId String?
+  aiSystem   AiSystem? @relation(fields: [aiSystemId], references: [id])
+
+  sourceType EvidenceSourceType @default(MANUAL_UPLOAD)
+  fileName   String
+  mimeType   String?
+  sizeBytes  Int
+  sha256     String
+  content    Bytes
+
+  validUntil DateTime?
+
+  reviewStatus EvidenceReviewStatus @default(PENDING)
+  reviewerId   String?
+  reviewer     User?     @relation("EvidenceReviewer", fields: [reviewerId], references: [id])
+  reviewedAt   DateTime?
+  reviewNote   String?
+
+  uploadedById String?
+  uploadedBy   User?    @relation("EvidenceUploader", fields: [uploadedById], references: [id])
+  createdAt    DateTime @default(now())
+
+  @@index([tenantId])
+  @@map("evidence")
+}
+
+model WebhookEndpoint {
+  id       String @id @default(uuid())
+  tenantId String
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  url         String
+  description String?
+  events      Json @default("[]") // event names (audit action values) or "*"
+  // AES-256-GCM encrypted at rest; shown to the creator exactly once.
+  secretEncrypted String
+  enabled     Boolean  @default(true)
+
+  createdById String?
+  createdAt   DateTime @default(now())
+
+  deliveries WebhookDelivery[]
+
+  @@index([tenantId])
+  @@map("webhook_endpoints")
+}
+
+model WebhookDelivery {
+  id         String @id @default(uuid())
+  tenantId   String
+  tenant     Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  endpointId String
+  endpoint   WebhookEndpoint @relation(fields: [endpointId], references: [id], onDelete: Cascade)
+
+  event      String
+  statusCode Int?
+  error      String?
+  durationMs Int?
+  createdAt  DateTime @default(now())
+
+  @@index([tenantId, endpointId])
+  @@map("webhook_deliveries")
+}
+
+// ---------- Phase 13 — accounts, sessions, MFA, and the data-principal portal ----------
+
+enum UserTokenType {
+  INVITE
+  PASSWORD_RESET
+}
+
+enum IntakeStatus {
+  UNVERIFIED
+  NEEDS_INFO
+  VERIFIED
+  REJECTED
+}
+
+// Server-side sessions: a JWT is only valid while its session row is live, so sessions can be listed,
+// revoked (logout, password change, deactivation) and time out when idle.
+model Session {
+  id       String @id @default(uuid())
+  tenantId String
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  userId   String
+  user     User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  createdAt  DateTime  @default(now())
+  lastSeenAt DateTime  @default(now())
+  expiresAt  DateTime
+  ip         String?
+  userAgent  String?
+  // true while the user still has to enrol MFA (tenant requires it): only /auth/* is usable
+  restricted  Boolean  @default(false)
+  mfaVerified Boolean  @default(false)
+  revokedAt   DateTime?
+
+  @@index([userId])
+  @@index([tenantId])
+  @@map("sessions")
+}
+
+// One-time invite / password-reset tokens. Only the SHA-256 of the token is stored; the token itself is
+// shown once to the admin (Privault has no email delivery — the admin passes the link on).
+model UserToken {
+  id       String @id @default(uuid())
+  tenantId String
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  userId   String
+  user     User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  type      UserTokenType
+  tokenHash String        @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdById String?
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+  @@map("user_tokens")
+}
+
+// A rights request submitted by a member of the public through the portal. It is UNVERIFIED until staff
+// confirm the requester's identity — nothing is searched, exported or erased on an unverified request.
+model DsarIntake {
+  id       String @id @default(uuid())
+  tenantId String
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  reference String
+  requestType DsarRequestType
+  requesterName String
+  contactType   String // EMAIL | PHONE
+  contactValue  String
+  dataSubjectIdentifier String?
+  details       String?
+  isNominee     Boolean @default(false)
+  nomineeRelationship String?
+
+  status IntakeStatus @default(UNVERIFIED)
+  // SHA-256 of the status token given to the requester once; lets them check progress without an account.
+  statusTokenHash String
+  publicMessage   String? // shown to the requester on the status page
+
+  receivedAt         DateTime @default(now()) // the response clock starts here, not at verification
+  verifiedAt         DateTime?
+  verifiedById       String?
+  verifiedBy         User?     @relation("IntakeVerifier", fields: [verifiedById], references: [id])
+  verificationMethod String?
+  verificationNote   String?
+
+  dsarId String? @unique
+  dsar   Dsar?   @relation(fields: [dsarId], references: [id])
+
+  ipHash    String? // keyed hash, for abuse analysis without storing the address
+  createdAt DateTime @default(now())
+
+  @@unique([tenantId, reference])
+  @@index([tenantId, status])
+  @@map("dsar_intakes")
+}
+
+model AuditLog {
+  id       String @id @default(uuid())
+  tenantId String
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  userId String?
+  user   User?   @relation(fields: [userId], references: [id])
+  role   String?
+
+  action       String // e.g. AI_SYSTEM_CREATED, AI_SYSTEM_UPDATED, AI_SYSTEM_ARCHIVED, LOGIN
+  objectType   String // e.g. AiSystem, User
+  objectId     String?
+  previousValue Json?
+  newValue      Json?
+
+  source    String  @default("app") // app | api | connector
+  reason    String?
+  ipAddress String?
+
+  timestamp DateTime @default(now())
+
+  // Tamper evidence: each row carries the SHA-256 of its own content chained to the previous row of the
+  // same tenant. Rows written before this existed have NULLs. The table is also append-only at the database
+  // level (see the audit_logs_append_only trigger in migration 20260929000000).
+  seq      Int?
+  prevHash String?
+  hash     String?
+
+  @@unique([tenantId, seq])
+  @@index([tenantId, timestamp])
+  @@index([tenantId, objectType, objectId])
+  @@map("audit_logs")
+}

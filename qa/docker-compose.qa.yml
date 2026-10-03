@@ -1,0 +1,35 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: privault
+      POSTGRES_PASSWORD: privault
+      POSTGRES_DB: privault_ai_governance
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U privault -d postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    tmpfs:
+      - /var/lib/postgresql/data
+
+  qa:
+    build:
+      context: ..
+      dockerfile: qa/Dockerfile.test
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PGHOST: db
+      PGPORT: "5432"
+      PGUSER: privault
+      PGPASSWORD: privault
+      PGDATABASE: privault_ai_governance
+      E2E_ADMIN_URL: postgresql://privault:privault@db:5432/postgres
+      DATABASE_URL: postgresql://privault:privault@db:5432/privault_ai_governance
+      JWT_SECRET: qa-test-secret-please-change-32-chars-min
+      WEBHOOK_ENC_KEY: 0123456789abcdef0123456789abcdef
+      PII_INDEX_KEY: abcdef0123456789abcdef0123456789
+      NODE_ENV: test
+    command: ["bash", "qa/run-full-tests.sh"]
